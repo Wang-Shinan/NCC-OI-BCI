@@ -237,10 +237,17 @@ with st.sidebar:
     else:
         data_path = st.selectbox("Data file", data_files, disabled=not availability.configuration_enabled)
     if not packages:
-        st.warning("No model package found under runs.")
+        st.info(
+            "No schema-v2 Runtime Package under model_packages/ or runs/. "
+            "This Replay page needs a 50M / LaBraM / CBraMod export "
+            "(package.yaml + backbone.pt). REVE weights in "
+            "checkpoints/backbones/reve-* are served separately at "
+            "ws://127.0.0.1:8768 — use Passive BCI, not this page."
+        )
         package_path = st.text_input(
             "Model package",
-            str(ROOT / "runs" / "day1_bnci_s01" / "model_package"),
+            "",
+            placeholder="model_packages/.../v1  or  runs/.../model_package",
             disabled=not availability.configuration_enabled,
         )
     else:
@@ -263,38 +270,44 @@ with st.sidebar:
     package_step_default = 0.5
     package_threshold_default = 0.55
 
-    try:
-        package_summary = describe_package(
-            package_path
-        )
+    package_dir = Path(package_path).expanduser() if package_path else None
+    if package_dir is not None and package_dir.is_dir():
+        try:
+            package_summary = describe_package(
+                str(package_dir)
+            )
 
-        selected_package_name = str(
-            package_summary["model_name"]
-        )
+            selected_package_name = str(
+                package_summary["model_name"]
+            )
 
-        package_window_default = float(
-            package_summary["window_sec"]
-        )
+            package_window_default = float(
+                package_summary["window_sec"]
+            )
 
-        package_step_default = float(
-            package_summary["step_sec"]
-        )
+            package_step_default = float(
+                package_summary["step_sec"]
+            )
 
-        package_threshold_default = float(
-            package_summary[
-                "confidence_threshold"
-            ]
-        )
+            package_threshold_default = float(
+                package_summary[
+                    "confidence_threshold"
+                ]
+            )
 
-    except Exception as exc:
-        package_summary = None
-        selected_package_name = None
+        except Exception as exc:
+            package_summary = None
+            selected_package_name = None
 
-        # 保留上面初始化的安全默认值，
-        # 不再访问旧版 model.yaml 变量。
+            # 保留上面初始化的安全默认值，
+            # 不再访问旧版 model.yaml 变量。
+            st.warning(
+                "Cannot read Runtime Package "
+                f"metadata: {exc}"
+            )
+    elif package_path:
         st.warning(
-            "Cannot read Runtime Package "
-            f"metadata: {exc}"
+            f"Model package directory does not exist: {package_dir}"
         )
 
     if selected_package_name:

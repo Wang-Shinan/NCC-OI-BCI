@@ -83,8 +83,10 @@ def train_linear_head(
     class_indices: list[int] | None = None,
     val_features: torch.Tensor | None = None,
     val_labels: torch.Tensor | None = None,
+    reset: bool = True,
 ) -> None:
-    init_linear_head(head)
+    if reset:
+        init_linear_head(head)
     n_out = len(class_indices) if class_indices is not None else head.out_features
     counts = torch.bincount(labels, minlength=n_out).float()
     weights = (counts.clamp_min(1).sum() / (counts.clamp_min(1) * len(counts))).to(features.device)
@@ -203,6 +205,20 @@ def clone_linear(head: nn.Linear) -> nn.Linear:
     return copy
 
 
+def load_init_state(backend: ReveModelBackend, path: Path) -> None:
+    if backend._head is None:
+        raise SystemExit("head is not loaded")
+    payload = torch.load(path, map_location=backend._head.weight.device, weights_only=False)
+    if not isinstance(payload, dict) or "head" not in payload:
+        raise SystemExit(f"--init-state missing head weights: {path}")
+    backend._head.load_state_dict(payload["head"])
+    backend._update_step = int(payload.get("step", 0))
+    print(
+        f"[fit-smr] init-state loaded encoder={payload.get('encoder_id')} "
+        f"task={payload.get('task')} step={backend._update_step} {path}"
+    )
+
+
 def save_state(path: Path, backend: ReveModelBackend) -> None:
     if backend._head is None:
         raise SystemExit("head is not loaded")
@@ -221,11 +237,17 @@ def save_state(path: Path, backend: ReveModelBackend) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Fit a frozen-REVE smr_control head from Passive-BCI smr-adapt bins."
+        description="Fit a frozen-REVE smr_control head from Passive-BCI smr-adapt bins (non-overlapping 2s windows)."
     )
     parser.add_argument("--recordings", type=Path, default=default_recordings_root())
     parser.add_argument("--session", action="append", default=[], help="Recording folder name or path. Repeatable.")
     parser.add_argument("--state-file", type=Path, default=None)
+    parser.add_argument(
+        "--init-state",
+        type=Path,
+        default=None,
+        help="Warm-start the linear head from an existing .pt; skips random re-init.",
+    )
     parser.add_argument("--size", choices=("base", "large"), default="base")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--epochs", type=int, default=400)
@@ -258,6 +280,18 @@ def main() -> None:
         help="Stratified train,val,test ratios, e.g. 8,1,1. Skips session holdout.",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--hop-sec",
+        type=float,
+        default=None,
+        help="Offline slice hop. Default equals the 2s window (non-overlapping). Do not use live 0.1s.",
+    )
+    parser.add_argument(
+        "--label-source",
+        choices=("auto", "trial"),
+        default="auto",
+        help="trial = tile 2s windows across feedbackSec (default 6s). auto prefers smr_window/foundation_label.",
+    )
     args = parser.parse_args()
 
     recordings_root = args.recordings.resolve()
@@ -268,7 +302,11 @@ def main() -> None:
             sessions.append(path if path.is_dir() else recordings_root / item)
     else:
         sessions = discover_smr_recordings(recordings_root)
-    windows = extract_all_labeled_windows(sessions)
+    windows = extract_all_labeled_windows(
+        sessions,
+        hop_sec=args.hop_sec,
+        label_source=args.label_source,
+    )
     class_indices: list[int] | None = None
     report_names: tuple[str, ...] = SMR_CONTROL_CLASS_NAMES
     if args.classes:
@@ -316,6 +354,14 @@ def main() -> None:
     backend.load()
     if backend._head is None:
         raise SystemExit("REVE head is not loaded")
+    reset_head = args.init_state is None
+    if args.init_state is not None:
+        init_path = args.init_state.resolve()
+        if not init_path.is_file():
+            raise SystemExit(f"Missing --init-state: {init_path}")
+        if init_path == state_file:
+            raise SystemExit("--init-state and --state-file must be different paths")
+        load_init_state(backend, init_path)
 
     features, labels = encode_windows(backend, windows)
     if class_indices is not None:
@@ -325,6 +371,11 @@ def main() -> None:
     with torch.no_grad():
         zero_shot = select_logits(backend._head(features), class_indices)
     classification_report("zero-shot", zero_shot, labels, report_names)
+    today_mask = torch.tensor(["0824" in item.session_id for item in windows], device=features.device)
+    if bool(today_mask.any()):
+        classification_report("zero-shot today", zero_shot[today_mask], labels[today_mask], report_names)
+    if bool((~today_mask).any()) and bool(today_mask.any()):
+        classification_report("zero-shot historical", zero_shot[~today_mask], labels[~today_mask], report_names)
 
     split_parts = parse_split(args.split) if args.split else None
     if split_parts is not None:
@@ -344,6 +395,7 @@ def main() -> None:
             class_indices=class_indices,
             val_features=features[val_idx] if len(val_idx) else None,
             val_labels=labels[val_idx] if len(val_idx) else None,
+            reset=reset_head,
         )
         backend._head.eval()
         with torch.no_grad():
@@ -353,6 +405,8 @@ def main() -> None:
             classification_report("val", logits[val_idx], labels[val_idx], report_names)
         if len(test_idx):
             classification_report("test", logits[test_idx], labels[test_idx], report_names)
+        if bool(today_mask.any()):
+            classification_report("joint today", logits[today_mask], labels[today_mask], report_names)
     else:
         session_ids = [item.session_id for item in windows]
         unique_sessions = list(dict.fromkeys(session_ids))
@@ -370,6 +424,7 @@ def main() -> None:
                     epochs=args.epochs,
                     lr=args.lr,
                     class_indices=class_indices,
+                    reset=reset_head,
                 )
                 probe.eval()
                 with torch.no_grad():
@@ -388,6 +443,7 @@ def main() -> None:
             epochs=args.epochs,
             lr=args.lr,
             class_indices=class_indices,
+            reset=reset_head,
         )
         backend._head.eval()
         with torch.no_grad():

@@ -16,6 +16,7 @@ from bci_dayloop.serving.profiles import (
     REVE_STEP_SEC,
     REVE_TARGET_HZ,
     REVE_WINDOW_SEC,
+    TETRIS_LIVE_STEP_SEC,
 )
 from bci_dayloop.serving.protocol import (
     ParsedFeedback,
@@ -64,6 +65,7 @@ class ReveTaskSpec:
     class_names: tuple[str, ...]
     output_semantics: str
     hello_task: str
+    live_step_sec: float = REVE_STEP_SEC
 
 
 REVE_TASKS: dict[str, ReveTaskSpec] = {
@@ -78,6 +80,7 @@ REVE_TASKS: dict[str, ReveTaskSpec] = {
         class_names=TETRIS_ACTION_CLASS_NAMES,
         output_semantics="tetris_action_7",
         hello_task="tetris_action",
+        live_step_sec=TETRIS_LIVE_STEP_SEC,
     ),
     "smr_control": ReveTaskSpec(
         id="smr_control",
@@ -111,6 +114,11 @@ def normalize_reve_task(value: str) -> str:
 
 def get_reve_task(task: str) -> ReveTaskSpec:
     return REVE_TASKS[normalize_reve_task(task)]
+
+
+def live_step_sec_for_task(task: str) -> float:
+    """Hello hop for live decode. Offline export/fit must use hop=window, not this value."""
+    return get_reve_task(task).live_step_sec
 
 
 def default_serve_strategy(task: str) -> str:
@@ -269,7 +277,7 @@ class ReveModelBackend:
     positions_dir: Path
     device: str = "auto"
     window_sec: float = REVE_WINDOW_SEC
-    step_sec: float = REVE_STEP_SEC
+    step_sec: float | None = None
     target_hz: float = REVE_TARGET_HZ
     class_names: tuple[str, ...] = ORDINAL_CLASS_NAMES
     task: str = "passive_rating"
@@ -296,6 +304,12 @@ class ReveModelBackend:
         self.task = spec.id
         self.class_names = spec.class_names
         self._replay = [[] for _ in spec.class_names]
+        resolved_step = spec.live_step_sec if self.step_sec is None else float(self.step_sec)
+        if not (resolved_step > 0) or resolved_step > float(self.window_sec):
+            raise ValueError(
+                f"live step_sec must satisfy 0 < step_sec <= window_sec, got {resolved_step}"
+            )
+        self.step_sec = resolved_step
         if self.lora_checkpoint is not None:
             self.lora_checkpoint = Path(self.lora_checkpoint)
 
@@ -386,7 +400,7 @@ class ReveModelBackend:
             model_revision=self.model_revision,
             strategy=self.strategy,
             window_sec=self.window_sec,
-            step_sec=self.step_sec,
+            step_sec=float(self.step_sec),
         )
 
     def predict(self, window: ParsedWindow) -> PredictionResult:
@@ -584,6 +598,10 @@ class ReveModelBackend:
             return
         saved_encoder = str(payload.get("encoder_id", self.model_dir.name))
         if saved_encoder != self.encoder_id:
+            print(
+                f"[reve] state-file skipped encoder mismatch "
+                f"saved={saved_encoder} serving={self.encoder_id}"
+            )
             return
         try:
             self._head.load_state_dict(payload["head"])
@@ -591,6 +609,10 @@ class ReveModelBackend:
             return
         self._update_step = int(payload.get("step", 0))
         self.model_revision = str(payload.get("model_revision", self.model_revision))
+        print(
+            f"[reve] state-file loaded encoder={saved_encoder} "
+            f"step={self._update_step} {self.state_file}"
+        )
         saved_replay = payload.get("replay")
         if isinstance(saved_replay, list) and len(saved_replay) == len(self.class_names):
             restored: list[list[torch.Tensor]] = []

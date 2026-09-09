@@ -42,7 +42,7 @@ def resolve_sessions(root: Path, sessions: list[str] | None) -> list[Path]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Export Passive-BCI SMR bins as NCC EEGHDF5 (2s windows, uV, CT)."
+        description="Export Passive-BCI SMR bins as NCC EEGHDF5 (2s non-overlapping windows, uV, CT)."
     )
     parser.add_argument("--recordings", type=Path, default=default_recordings_root())
     parser.add_argument(
@@ -57,6 +57,15 @@ def main() -> None:
     parser.add_argument("--subject-id", type=int, default=1)
     parser.add_argument("--keep-padded", action="store_true")
     parser.add_argument("--window-sec", type=float, default=2.0)
+    parser.add_argument(
+        "--hop-sec",
+        type=float,
+        default=None,
+        help=(
+            "Offline slice hop. Default equals --window-sec (non-overlapping). "
+            "Do not pass the live Tetris 0.1s hop here."
+        ),
+    )
     args = parser.parse_args()
 
     recordings_root = args.recordings.resolve()
@@ -65,6 +74,7 @@ def main() -> None:
         recordings,
         window_sec=args.window_sec,
         label_source=args.label_source,
+        hop_sec=args.hop_sec,
     )
     if not windows:
         raise SystemExit(f"No labeled SMR trials in {args.recordings}")
@@ -80,10 +90,12 @@ def main() -> None:
     loaded = dataset.load()
     counts = Counter(int(label) for label in loaded["labels"])
     named = {SMR_CONTROL_CLASS_NAMES[index]: counts[index] for index in range(len(SMR_CONTROL_CLASS_NAMES))}
+    hop_sec = args.window_sec if args.hop_sec is None else args.hop_sec
     print(
         f"[export-smr] {path} trials={loaded['data'].shape[0]} "
         f"shape={tuple(loaded['data'].shape)} Hz={dataset.metadata.sample_rate:g} "
         f"unit={dataset.metadata.unit} classes={named} "
+        f"window={args.window_sec:g}s hop={hop_sec:g}s "
         f"sessions={dataset.sessions()}"
     )
 

@@ -9,6 +9,9 @@ import torch
 from torch import nn
 
 PEFT_BACKBONE_PREFIX = "encoder.backbone.base_model.model."
+S02_0825PM_JOINT_LORA_ID = "smr_control_s02_4class_reve_0825pm_joint_livehead_lora"
+S02_0825PM_HOP01_LORA_ID = "smr_control_s02_4class_reve_0825pm_hop01_lp_lora"
+S02_0821_LIVEHEAD_LORA_ID = "smr_control_s02_4class_reve_0821_livehead_lora"
 S02_LIVEHEAD_LORA_ID = "smr_control_s02_4class_reve_livehead_lora"
 S01_LIVEHEAD_LORA_ID = "smr_control_s01_4class_reve_livehead_lora"
 STIEGER_4CLASS_LORA_ID = "stieger2021_4class_reve_lora_r16_mi5init"
@@ -20,6 +23,15 @@ def default_adapter_root() -> Path:
 
 
 def default_stieger_lora_checkpoint() -> Path | None:
+    s02_joint = default_adapter_root() / S02_0825PM_JOINT_LORA_ID / "best.pt"
+    if s02_joint.is_file():
+        return s02_joint
+    s02_0825pm = default_adapter_root() / S02_0825PM_HOP01_LORA_ID / "best.pt"
+    if s02_0825pm.is_file():
+        return s02_0825pm
+    s02_0821 = default_adapter_root() / S02_0821_LIVEHEAD_LORA_ID / "best.pt"
+    if s02_0821.is_file():
+        return s02_0821
     s02 = default_adapter_root() / S02_LIVEHEAD_LORA_ID / "best.pt"
     if s02.is_file():
         return s02
@@ -37,7 +49,11 @@ def encoder_id_for_lora(path: Path | None, fallback: str) -> str:
 
 
 def lora_state_stem(encoder_id: str) -> str:
-    if encoder_id == S02_LIVEHEAD_LORA_ID:
+    if encoder_id == S02_0825PM_JOINT_LORA_ID:
+        return "smr_control_s02_0825pm_joint_4class_livehead"
+    if encoder_id == S02_0825PM_HOP01_LORA_ID:
+        return "smr_control_s02_0825pm_4class_livehead"
+    if encoder_id in {S02_0821_LIVEHEAD_LORA_ID, S02_LIVEHEAD_LORA_ID}:
         return "smr_control_s02_4class_livehead"
     if encoder_id == S01_LIVEHEAD_LORA_ID:
         return "smr_control_s01_4class_livehead"

@@ -88,6 +88,8 @@ def test_reve_tetris_task_hello_and_label_space(tmp_path: Path):
     )
     hello = backend.hello_payload()
     assert hello["model"]["task"] == "tetris_action"
+    assert hello["input"]["window_sec"] == 2.0
+    assert hello["input"]["step_sec"] == 0.1
     assert hello["model"]["class_names"] == list(TETRIS_ACTION_CLASS_NAMES)
     assert backend._resolve_label(
         ParsedFeedback(
@@ -121,6 +123,7 @@ def test_reve_smr_control_task_hello_and_label_space(tmp_path: Path):
     )
     hello = backend.hello_payload()
     assert hello["model"]["task"] == "smr_control"
+    assert hello["input"]["step_sec"] == 0.5
     assert hello["model"]["class_names"] == list(SMR_CONTROL_CLASS_NAMES)
     assert backend._resolve_label(
         ParsedFeedback(
@@ -344,14 +347,30 @@ def test_encoder_id_uses_lora_folder_name(tmp_path: Path):
 
 
 def test_normalize_reve_task_aliases_and_rejects_unknown():
-    from bci_dayloop.serving.reve import get_reve_task, normalize_reve_task
+    from bci_dayloop.serving.reve import get_reve_task, live_step_sec_for_task, normalize_reve_task
 
     assert normalize_reve_task("smr-cursor") == "smr_control"
     assert normalize_reve_task("TETRIS") == "tetris_action"
     assert normalize_reve_task("ordinal") == "passive_rating"
     assert get_reve_task("smr").output_semantics == "smr_control_4"
+    assert live_step_sec_for_task("tetris_action") == 0.1
+    assert live_step_sec_for_task("smr_control") == 0.5
+    assert live_step_sec_for_task("passive_rating") == 0.5
     with pytest.raises(ValueError, match="Unknown REVE task"):
         normalize_reve_task("motor_imagery")
+
+
+def test_smr_control_live_step_override_does_not_change_task_default(tmp_path: Path):
+    backend = ReveModelBackend(
+        model_dir=tmp_path / "reve-base",
+        positions_dir=tmp_path / "reve-positions",
+        task="smr_control",
+        step_sec=0.1,
+    )
+    hello = backend.hello_payload()
+    assert hello["model"]["task"] == "smr_control"
+    assert hello["input"]["window_sec"] == 2.0
+    assert hello["input"]["step_sec"] == 0.1
 
 
 def test_smr_control_default_serve_strategy_is_none():
@@ -539,6 +558,9 @@ def test_load_reve_lora_payload_and_apply_merged_linear(tmp_path: Path):
         lora_state_stem,
     )
 
+    assert lora_state_stem("smr_control_s02_4class_reve_0825pm_joint_livehead_lora") == "smr_control_s02_0825pm_joint_4class_livehead"
+    assert lora_state_stem("smr_control_s02_4class_reve_0825pm_hop01_lp_lora") == "smr_control_s02_0825pm_4class_livehead"
+    assert lora_state_stem("smr_control_s02_4class_reve_0821_livehead_lora") == "smr_control_s02_4class_livehead"
     assert lora_state_stem("smr_control_s02_4class_reve_livehead_lora") == "smr_control_s02_4class_livehead"
     assert lora_state_stem("smr_control_s01_4class_reve_livehead_lora") == "smr_control_s01_4class_livehead"
     assert lora_state_stem("stieger2021_4class_reve_lora_r16_mi5init") == "smr_control_stieger_4class_lora"

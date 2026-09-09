@@ -707,7 +707,7 @@ streamlit run web/app.py
 
 ## 17.1 Passive BCI 模型服务
 
-[Passive BCI](https://github.com/ttkx-web) 浏览器负责采集与切窗；本仓库提供 WebSocket 推理服务。浏览器只发送原始 `uV`、`layout=CT` 窗口。窗长由 hello 的 `input.window_sec` 声明：mock / 50M 为 4 秒，本地 REVE 为 2 秒。
+[Passive BCI](https://github.com/ttkx-web) 浏览器负责采集与切窗；本仓库提供 WebSocket 推理服务。浏览器只发送原始 `uV`、`layout=CT` 窗口。窗长由 hello 的 `input.window_sec` 声明：mock / 50M 为 4 秒，本地 REVE 为 2 秒。在线 `step_sec`：`tetris_action` 默认 0.1 秒；`smr_control` 默认 0.5 秒（俄罗斯方块页会传 `--step-sec 0.1`）。离线 export/fit 切窗不重叠（hop=窗长），不要用在线 0.1s hop。
 
 没有 Runtime Package 时用固定概率 mock：
 

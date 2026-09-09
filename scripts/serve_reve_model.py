@@ -33,6 +33,16 @@ def main() -> None:
         default="passive_rating",
         help="passive_rating (任务一/任务二/任务三), tetris_action (7 Tetris ops), or smr_control (left/right/both/rest).",
     )
+    parser.add_argument(
+        "--step-sec",
+        type=float,
+        default=None,
+        help=(
+            "Live decode hop advertised in hello. Default: 0.1s for tetris_action, "
+            "0.5s otherwise. Passive-BCI Tetris pages pass 0.1 even on smr_control. "
+            "Offline export/fit must not use this value (they use hop=window)."
+        ),
+    )
     parser.add_argument("--lr", type=float, default=0.05)
     parser.add_argument("--state-file", type=Path, default=None)
     parser.add_argument(
@@ -75,6 +85,7 @@ def main() -> None:
         device=args.device,
         strategy=strategy,
         task=args.task,
+        step_sec=args.step_sec,
         lr=args.lr,
         state_file=args.state_file,
         lora_checkpoint=lora_checkpoint,

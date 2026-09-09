@@ -117,6 +117,35 @@ def test_extract_prefers_smr_window_events(tmp_path: Path):
     assert trial_windows[0].target == "left"
 
 
+def test_extract_drops_overlapping_live_smr_windows(tmp_path: Path):
+    sample_rate = 250
+    origin = 1000
+    n_samples = 1000
+    events = [
+        {
+            "type": "smr_window",
+            "data": {"trialIndex": 0, "target": "left", "label": 0, "className": "left_hand"},
+            "eeg": {"sampleIndex": origin + local_end},
+        }
+        for local_end in range(500, 1001, 25)
+    ]
+    recording = _write_recording(
+        tmp_path,
+        "bcigo_tetris-adapt_S01_livehop",
+        events=events,
+        n_samples=n_samples,
+        origin=origin,
+        sample_rate=sample_rate,
+    )
+    windows = extract_labeled_windows(recording, window_sec=2.0)
+    assert len(windows) == 2
+    data = np.fromfile(recording / "eeg.bin", dtype="<f4").reshape(n_samples, 2)
+    np.testing.assert_array_equal(windows[0].data, data[0:500].T)
+    np.testing.assert_array_equal(windows[1].data, data[500:1000].T)
+    overlapping = extract_labeled_windows(recording, window_sec=2.0, hop_sec=0.1)
+    assert len(overlapping) == len(events)
+
+
 def test_windows_to_hdf5_matches_ncc_reader(tmp_path: Path):
     from bci_dayloop.data.hdf5_dataset import EEGHDF5
     from bci_dayloop.serving.reve import SMR_CONTROL_CLASS_NAMES
@@ -310,3 +339,60 @@ def test_windows_to_hdf5_drops_padded_and_rejects_empty(tmp_path: Path):
         windows_to_hdf5([padded], tmp_path / "empty.h5", drop_padded=True)
     path = windows_to_hdf5([padded], tmp_path / "kept.h5", drop_padded=False)
     assert path.is_file()
+
+
+def test_extract_tiles_trial_feedback_into_nonoverlapping_windows(tmp_path: Path):
+    sample_rate = 250
+    origin = 1000
+    local_end = 1800
+    recording = _write_recording(
+        tmp_path,
+        "bcigo_smr-adapt_S05_sixsec",
+        n_samples=2000,
+        origin=origin,
+        events=[
+            {
+                "type": "trial",
+                "data": {"index": 0, "target": "left", "outcome": "timeout", "feedbackSec": 6.0},
+                "eeg": {"sampleIndex": origin + local_end, "sampleRate": sample_rate},
+            }
+        ],
+    )
+    windows = extract_labeled_windows(recording, window_sec=2.0)
+    assert len(windows) == 3
+    assert {item.trial_index for item in windows} == {0}
+    data = np.fromfile(recording / "eeg.bin", dtype="<f4").reshape(2000, 2)
+    for i, window in enumerate(windows):
+        slice_end = local_end - (2 - i) * 500
+        slice_start = slice_end - 500
+        np.testing.assert_array_equal(window.data, data[slice_start:slice_end].T)
+
+
+def test_extract_short_trial_keeps_only_full_windows(tmp_path: Path):
+    origin = 1000
+    local_end = 1200
+    recording = _write_recording(
+        tmp_path,
+        "bcigo_smr-adapt_S06_early",
+        n_samples=1500,
+        origin=origin,
+        events=[
+            {
+                "type": "trial",
+                "data": {"index": 0, "target": "right", "outcome": "hit", "feedbackSec": 3.5},
+                "eeg": {"sampleIndex": origin + local_end},
+            },
+            {
+                "type": "trial",
+                "data": {"index": 1, "target": "left", "outcome": "hit", "feedbackSec": 1.4},
+                "eeg": {"sampleIndex": origin + 400},
+            },
+        ],
+    )
+    windows = extract_labeled_windows(recording, window_sec=2.0)
+    assert len(windows) == 1
+    assert windows[0].trial_index == 0
+    assert windows[0].class_name == "right_hand"
+    data = np.fromfile(recording / "eeg.bin", dtype="<f4").reshape(1500, 2)
+    np.testing.assert_array_equal(windows[0].data, data[local_end - 500 : local_end].T)
+

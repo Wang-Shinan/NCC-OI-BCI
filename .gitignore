@@ -94,3 +94,6 @@ registries/**
 
 *.log
 repo_gitignore_audit.txt
+# Local object-storage credentials
+content_rclone.txt
+

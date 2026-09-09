@@ -88,6 +88,89 @@ def load_ct_bin(path: Path, channels: int) -> np.ndarray:
 
 LABEL_EVENT_TYPES = ("smr_window", "foundation_label")
 LABEL_SOURCES = ("auto", "trial")
+# smr-adapt feedback phase; early hits use the logged feedbackSec instead.
+SMR_FEEDBACK_SEC = 6.0
+
+
+def _event_end_index(event: dict[str, Any]) -> int | None:
+    end_index = (event.get("eeg") or {}).get("sampleIndex")
+    if end_index is None:
+        return None
+    return int(end_index)
+
+
+def _event_mi_duration_sec(event: dict[str, Any]) -> float:
+    payload = event.get("data") or {}
+    raw = payload.get("feedbackSec")
+    if raw is None:
+        return SMR_FEEDBACK_SEC
+    return max(0.0, float(raw))
+
+
+def _trial_index(payload: dict[str, Any], fallback: int) -> int:
+    for key in ("trialIndex", "index"):
+        if payload.get(key) is not None:
+            return int(payload[key])
+    return fallback
+
+
+def _window_end_indices_for_event(
+    event: dict[str, Any],
+    *,
+    sample_rate: float,
+    window_samples: int,
+    hop_samples: int,
+) -> list[int]:
+    """2s tiles inside the motor-imagery span. smr_window events are already windows."""
+    end_index = _event_end_index(event)
+    if end_index is None:
+        return []
+    if str(event.get("type") or "") != "trial":
+        return [end_index]
+    duration_samples = int(round(_event_mi_duration_sec(event) * sample_rate))
+    if duration_samples <= 0 or window_samples <= 0 or hop_samples <= 0:
+        return []
+    trial_start = end_index - duration_samples
+    ends: list[int] = []
+    cursor = end_index
+    while cursor - window_samples >= trial_start:
+        ends.append(cursor)
+        next_cursor = cursor - hop_samples
+        if next_cursor >= cursor:
+            break
+        cursor = next_cursor
+    ends.reverse()
+    return ends
+
+
+def _keep_nonoverlapping_events(
+    events: list[dict[str, Any]],
+    *,
+    hop_samples: int,
+) -> list[dict[str, Any]]:
+    """Keep last window of each non-overlapping slot.
+
+    Live Tetris REVE may log smr_window at 0.1s hop; offline export/fit must
+    not reuse that hop. Default hop_samples = window length.
+    """
+    indexed: list[tuple[int, dict[str, Any]]] = []
+    seen: set[int] = set()
+    for event in events:
+        end_index = _event_end_index(event)
+        if end_index is None or end_index in seen:
+            continue
+        seen.add(end_index)
+        indexed.append((end_index, event))
+    indexed.sort(key=lambda item: item[0])
+    kept_rev: list[dict[str, Any]] = []
+    last_end: int | None = None
+    for end_index, event in reversed(indexed):
+        if last_end is not None and last_end - end_index < hop_samples:
+            continue
+        kept_rev.append(event)
+        last_end = end_index
+    kept_rev.reverse()
+    return kept_rev
 
 
 def _iter_label_events(
@@ -122,6 +205,7 @@ def extract_labeled_windows(
     window_sec: float = 2.0,
     min_coverage: float = 0.8,
     label_source: str = "auto",
+    hop_sec: float | None = None,
 ) -> list[LabeledWindow]:
     eeg_meta = _read_json(recording_dir / "eeg.json")
     session = _read_json(recording_dir / "session.json") if (recording_dir / "session.json").is_file() else eeg_meta
@@ -132,50 +216,64 @@ def extract_labeled_windows(
     n_samples = int(data.shape[1])
     origin = _file_origin_sample_index(session, n_samples)
     window_samples = int(round(window_sec * sample_rate))
+    # Live hop (Tetris 0.1s) is for decode/logging only; offline slices do not overlap.
+    resolved_hop = float(window_sec if hop_sec is None else hop_sec)
+    if not (resolved_hop > 0):
+        raise ValueError(f"hop_sec must be positive, got {resolved_hop}")
+    hop_samples = int(round(resolved_hop * sample_rate))
     min_samples = int(round(window_samples * min_coverage))
     windows: list[LabeledWindow] = []
     seen: set[int] = set()
-
+    labeled_events: list[dict[str, Any]] = []
     for event in _iter_label_events(recording_dir / "events.jsonl", label_source=label_source):
+        payload = event.get("data") or {}
+        target = str(payload.get("target") or "").strip().lower()
+        if class_id_for_target(target) is None or _event_end_index(event) is None:
+            continue
+        labeled_events.append(event)
+    events = _keep_nonoverlapping_events(labeled_events, hop_samples=hop_samples)
+
+    for event in events:
         payload = event.get("data") or {}
         target = str(payload.get("target") or "").strip().lower()
         class_id = class_id_for_target(target)
         if class_id is None:
             continue
-        eeg = event.get("eeg") or {}
-        end_index = eeg.get("sampleIndex")
-        if end_index is None:
-            continue
-        end_index = int(end_index)
-        if end_index in seen:
-            continue
-        seen.add(end_index)
-        local_end = end_index - origin
-        local_start = local_end - window_samples
-        if local_end <= 0 or local_end - min_samples < 0:
-            continue
-        slice_start = max(0, local_start)
-        slice_end = min(n_samples, local_end)
-        if slice_end - slice_start < min_samples:
-            continue
-        window = np.zeros((channels, window_samples), dtype=np.float32)
-        dest_start = slice_start - local_start
-        dest_end = dest_start + (slice_end - slice_start)
-        window[:, dest_start:dest_end] = data[:, slice_start:slice_end]
-        windows.append(
-            LabeledWindow(
-                session_id=recording_dir.name,
-                trial_index=int(payload.get("trialIndex") or payload.get("index") or len(windows)),
-                target=target,
-                class_name=SMR_CONTROL_CLASS_NAMES[class_id],
-                class_id=class_id,
-                outcome=str(payload["outcome"]) if payload.get("outcome") is not None else None,
-                sample_rate=sample_rate,
-                channel_names=channel_names,
-                data=window,
-                padded=local_start < 0 or local_end > n_samples,
+        for end_index in _window_end_indices_for_event(
+            event,
+            sample_rate=sample_rate,
+            window_samples=window_samples,
+            hop_samples=hop_samples,
+        ):
+            if end_index in seen:
+                continue
+            seen.add(end_index)
+            local_end = end_index - origin
+            local_start = local_end - window_samples
+            if local_end <= 0 or local_end - min_samples < 0:
+                continue
+            slice_start = max(0, local_start)
+            slice_end = min(n_samples, local_end)
+            if slice_end - slice_start < min_samples:
+                continue
+            window = np.zeros((channels, window_samples), dtype=np.float32)
+            dest_start = slice_start - local_start
+            dest_end = dest_start + (slice_end - slice_start)
+            window[:, dest_start:dest_end] = data[:, slice_start:slice_end]
+            windows.append(
+                LabeledWindow(
+                    session_id=recording_dir.name,
+                    trial_index=_trial_index(payload, len(windows)),
+                    target=target,
+                    class_name=SMR_CONTROL_CLASS_NAMES[class_id],
+                    class_id=class_id,
+                    outcome=str(payload["outcome"]) if payload.get("outcome") is not None else None,
+                    sample_rate=sample_rate,
+                    channel_names=channel_names,
+                    data=window,
+                    padded=local_start < 0 or local_end > n_samples,
+                )
             )
-        )
     return windows
 
 
@@ -184,10 +282,18 @@ def extract_all_labeled_windows(
     *,
     window_sec: float = 2.0,
     label_source: str = "auto",
+    hop_sec: float | None = None,
 ) -> list[LabeledWindow]:
     windows: list[LabeledWindow] = []
     for path in recordings:
-        windows.extend(extract_labeled_windows(path, window_sec=window_sec, label_source=label_source))
+        windows.extend(
+            extract_labeled_windows(
+                path,
+                window_sec=window_sec,
+                label_source=label_source,
+                hop_sec=hop_sec,
+            )
+        )
     return windows
 
 

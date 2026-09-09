@@ -18,6 +18,19 @@ for candidate in (ROOT, SRC):
         sys.path.insert(0, str(candidate))
 
 from bci_dayloop.data.hdf5_dataset import EEGHDF5  # noqa: E402
+from bci_dayloop.demo.feature_monitor import (  # noqa: E402
+    FEATURE_CATALOG,
+    FEATURE_GROUPS,
+    all_feature_ids,
+    default_enabled_feature_ids,
+    display_keys_for_enabled,
+    features_in_group,
+    format_feature_value,
+    label_for_display_key,
+    monitor_values_from_result,
+    spark_color,
+    append_feature_history,
+)
 from bci_dayloop.demo.input import MIN_STEP_SEC, list_demo_sessions, load_demo_trial, trial_window, window_count  # noqa: E402
 from bci_dayloop.demo.model_package_discovery import discover_motor_intent_packages  # noqa: E402
 from bci_dayloop.demo.motor_decoder import DemoMotorIntentDecoder, ModelPackageMotorIntentDecoder, MotorIntentDecoder  # noqa: E402
@@ -52,6 +65,16 @@ h1 {font-size: 1.45rem !important; margin: 0 0 0.08rem !important; line-height: 
 .prob-track,.state-track {height:0.28rem; border-radius:99px; overflow:hidden; background:#263849;}.prob-fill,.state-fill {height:100%; border-radius:99px; background:#00A6A6;}
 .interpretation {font-size:0.82rem; line-height:1.38; color:#E7EFF4; margin-top:0.22rem;}.disclaimer {font-size:0.63rem; color:#8293A1; margin-top:0.42rem;}
 .section-label {font-size:0.80rem; font-weight:600; color:#DCE6ED; margin:0.40rem 0 0.23rem;}
+.feat-head {display:flex; align-items:center; justify-content:space-between; gap:0.6rem; flex-wrap:wrap; margin:0.40rem 0 0.18rem;}
+.feat-note {font-size:0.68rem; color:#8293A1; margin:0 0 0.35rem;}
+.feat-chip {font-size:0.68rem; color:#7ECCD1; background:#17212B; border:1px solid #263849; border-radius:99px; padding:0.10rem 0.50rem; white-space:nowrap;}
+.feat-grid {display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:0.42rem;}
+@media (max-width: 1200px) {.feat-grid {grid-template-columns:repeat(2, minmax(0, 1fr));}}
+.feat-card {min-height:82px; box-sizing:border-box; padding:0.48rem 0.58rem; background:#0c1220; border:1px solid #263849; border-radius:0.5rem; overflow:hidden;}
+.feat-top {display:flex; align-items:baseline; justify-content:space-between; gap:0.35rem;}
+.feat-name {font-size:0.72rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+.feat-value {font-family:ui-monospace, Consolas, monospace; font-size:0.92rem; font-weight:700; flex-shrink:0;}
+.feat-spark {width:100%; height:28px; display:block; margin-top:0.18rem;}
 .state-card {height:76px; box-sizing:border-box; padding:0.38rem 0.46rem; background:#17212B; border:1px solid #263849; border-radius:0.42rem; overflow:hidden;}
 .state-top,.state-bottom {display:flex; align-items:baseline; justify-content:space-between; gap:0.22rem;}.state-name {font-size:0.64rem; color:#B6C4CE; white-space:nowrap;}.state-value {font-size:1.02rem; color:#F3F6F9; font-weight:700;}.state-level {font-size:0.60rem; color:#7ECCD1;}.state-spark {width:48px; height:16px;}.state-track {margin-top:0.30rem; height:0.20rem;}
 .emotion-emoji {font-size:0.96rem; line-height:1;}.emotion-label {font-size:0.72rem; color:#7ECCD1; white-space:nowrap;}
@@ -188,6 +211,56 @@ def ensure_motor_decoder(
     return st.session_state.demo_motor_decoder, st.session_state.demo_motor_error
 
 
+def feature_widget_key(feature_id: str) -> str:
+    return f"demo_feat_{feature_id}"
+
+
+def ensure_feature_widget_state() -> None:
+    defaults = set(default_enabled_feature_ids())
+    for feature in FEATURE_CATALOG:
+        st.session_state.setdefault(feature_widget_key(feature.id), feature.id in defaults)
+
+
+def apply_enabled_features(ids: list[str]) -> None:
+    selected = set(ids)
+    for feature in FEATURE_CATALOG:
+        st.session_state[feature_widget_key(feature.id)] = feature.id in selected
+
+
+def enabled_feature_ids() -> list[str]:
+    ensure_feature_widget_state()
+    return [feature.id for feature in FEATURE_CATALOG if st.session_state.get(feature_widget_key(feature.id))]
+
+
+def queue_feature_selection(pending: object) -> None:
+    """Apply bulk checkbox changes on the next run, before widgets exist."""
+    st.session_state.demo_feature_pending = pending
+    st.rerun()
+
+
+def consume_pending_feature_selection() -> None:
+    pending = st.session_state.pop("demo_feature_pending", None)
+    if pending is None:
+        return
+    if pending == "light":
+        apply_enabled_features(default_enabled_feature_ids())
+        return
+    if pending == "all":
+        apply_enabled_features(all_feature_ids())
+        return
+    if pending == "clear":
+        apply_enabled_features([])
+        return
+    if not isinstance(pending, dict):
+        return
+    items = {feature.id for feature in features_in_group(str(pending.get("group", "")))}
+    current = set(enabled_feature_ids())
+    if pending.get("mode") == "group_on":
+        apply_enabled_features([feature.id for feature in FEATURE_CATALOG if feature.id in current | items])
+    elif pending.get("mode") == "group_off":
+        apply_enabled_features([feature.id for feature in FEATURE_CATALOG if feature.id in current - items])
+
+
 for key, value in {
     "demo_decoder": None,
     "demo_result": None,
@@ -214,10 +287,13 @@ for key, value in {
     "demo_app_run_count": 0,
     "demo_visual_fragment_run_count": 0,
     "demo_decode_fragment_run_count": 0,
+    "demo_feature_fragment_run_count": 0,
 }.items():
     st.session_state.setdefault(key, value)
 st.session_state.setdefault("demo_visual_state", VisualState())
 st.session_state.demo_app_run_count += 1
+ensure_feature_widget_state()
+consume_pending_feature_selection()
 
 defaults = command_line_defaults()
 available_files = discover_hdf5()
@@ -363,10 +439,7 @@ def decode_current_frame() -> None:
     # Re-render this media element only for a new decoder result, not on every
     # 15 Hz visual tick; this keeps both hemispheres in one stable frame.
     st.session_state.demo_cortical_revision += 1
-    for name, value in result.states.items():
-        history = st.session_state.demo_history.setdefault(name, [])
-        history.append(float(value))
-        del history[:-24]
+    append_feature_history(st.session_state.demo_history, monitor_values_from_result(result))
     st.session_state.demo_last_trial_index = current_trial_index
     st.session_state.demo_last_window_index = current_window_index
     st.session_state.demo_static_revision += 1
@@ -430,15 +503,21 @@ def decode_due_frames() -> None:
                 st.session_state.demo_trial_decode_complete = True
 
 
-def sparkline_svg(values: list[float]) -> str:
-    if len(values) < 2:
-        return '<svg class="state-spark" viewBox="0 0 48 16"></svg>'
+def sparkline_svg(values: list[float], color: str = "#00A6A6") -> str:
+    series = [float(value) for value in values[-60:] if value == value]
+    if len(series) < 2:
+        return '<svg class="feat-spark" viewBox="0 0 120 28"></svg>'
+    low, high = min(series), max(series)
+    span = max(high - low, 1e-6)
     points = []
-    for index, value in enumerate(values[-24:]):
-        x = 48 * index / (min(len(values), 24) - 1)
-        y = 15 - np.clip(value, 0.0, 100.0) * 0.13
+    for index, value in enumerate(series):
+        x = 2 + 116 * index / (len(series) - 1)
+        y = 25 - ((value - low) / span) * 21
         points.append(f"{x:.1f},{y:.1f}")
-    return f'<svg class="state-spark" viewBox="0 0 48 16"><polyline fill="none" stroke="#00A6A6" stroke-width="1.5" points="{" ".join(points)}"/></svg>'
+    return (
+        f'<svg class="feat-spark" viewBox="0 0 120 28" preserveAspectRatio="none">'
+        f'<polyline fill="none" stroke="{color}" stroke-width="1.6" points="{" ".join(points)}"/></svg>'
+    )
 
 
 def render_dashboard(result) -> None:
@@ -491,28 +570,63 @@ def render_dashboard(result) -> None:
             unsafe_allow_html=True,
         )
 
-    st.markdown('<div class="section-label">Neural State Index</div>', unsafe_allow_html=True)
-    state_items = list(STATE_LABELS_CN.items())
-    for row_start in range(0, len(state_items), 8):
-        cards = st.columns(8, gap="small")
-        for column, (name, chinese_name) in zip(cards, state_items[row_start : row_start + 8], strict=True):
-            value = result.states[name]
-            history = st.session_state.demo_history.get(name, [])
+
+def render_feature_picker() -> None:
+    """Main-script checkboxes stay outside fragments so playback does not remount them."""
+    ensure_feature_widget_state()
+    display_count = len(display_keys_for_enabled(enabled_feature_ids()))
+    st.markdown(
+        f'<div class="feat-head"><div class="section-label" style="margin:0">EEG 特征监控</div>'
+        f'<span class="feat-chip">滑窗 {window_sec:g}s · {display_count} 项</span></div>'
+        '<div class="feat-note">与 Passive-BCI 相同：分组勾选，只展示已选项。勾选区不随数据流重绘。</div>',
+        unsafe_allow_html=True,
+    )
+    actions = st.columns([1.1, 1, 1, 1, 3.2], gap="small")
+    if actions[0].button("轻量默认", use_container_width=True):
+        queue_feature_selection("light")
+    if actions[1].button("全选", use_container_width=True):
+        queue_feature_selection("all")
+    if actions[2].button("清空", use_container_width=True):
+        queue_feature_selection("clear")
+    with st.expander("展开勾选", expanded=False):
+        group_columns = st.columns(len(FEATURE_GROUPS), gap="small")
+        for column, (group_id, group_label) in zip(group_columns, FEATURE_GROUPS, strict=True):
+            items = features_in_group(group_id)
+            on_count = sum(1 for feature in items if st.session_state.get(feature_widget_key(feature.id)))
             with column:
-                if name == "emotion_state" and result.emotion is not None:
-                    st.markdown(
-                        f'<div class="state-card"><div class="state-top"><span class="state-name">{chinese_name}</span><span class="emotion-emoji">{result.emotion.emoji}</span></div>'
-                        f'<div class="state-bottom"><span class="emotion-label">{result.emotion.label_cn}</span>{sparkline_svg(history)}</div>'
-                        f'<div class="state-track"><div class="state-fill" style="width:{value:.1f}%"></div></div></div>',
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    st.markdown(
-                        f'<div class="state-card"><div class="state-top"><span class="state-name">{chinese_name}</span><span class="state-value">{value:.0f}</span></div>'
-                        f'<div class="state-bottom"><span class="state-level">{score_level(value)}</span>{sparkline_svg(history)}</div>'
-                        f'<div class="state-track"><div class="state-fill" style="width:{value:.1f}%"></div></div></div>',
-                        unsafe_allow_html=True,
-                    )
+                st.markdown(f"**{group_label}**  `{on_count}/{len(items)}`")
+                toggles = st.columns(2, gap="small")
+                if toggles[0].button("全开", key=f"demo_group_on_{group_id}", use_container_width=True):
+                    queue_feature_selection({"mode": "group_on", "group": group_id})
+                if toggles[1].button("全关", key=f"demo_group_off_{group_id}", use_container_width=True):
+                    queue_feature_selection({"mode": "group_off", "group": group_id})
+                for feature in items:
+                    extra = f"  ×{len(feature.expands_to)}" if feature.expands_to else ""
+                    st.checkbox(f"{feature.label}{extra}", key=feature_widget_key(feature.id))
+
+
+def render_feature_cards(result) -> None:
+    values = monitor_values_from_result(result)
+    keys = display_keys_for_enabled(enabled_feature_ids())
+    if not keys:
+        st.caption("请至少勾选一项特征。")
+        return
+    emotion_text = None
+    if result.emotion is not None:
+        emotion_text = f"{result.emotion.emoji} {result.emotion.label_cn}"
+    cards = []
+    for index, key in enumerate(keys):
+        color = spark_color(index)
+        raw = values.get(key)
+        history = st.session_state.demo_history.get(key, [])
+        cards.append(
+            f'<div class="feat-card"><div class="feat-top">'
+            f'<span class="feat-name" style="color:{color}">{label_for_display_key(key)}</span>'
+            f'<span class="feat-value" style="color:{color}">{format_feature_value(key, raw, emotion_text=emotion_text)}</span>'
+            f"</div>{sparkline_svg(history, color)}</div>"
+        )
+    st.markdown(f'<div class="feat-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+
 
 def visual_waveform() -> tuple[np.ndarray, list[str], float, str]:
     """Slice the current trial by stream time instead of decoder-window index."""
@@ -694,7 +808,25 @@ def render_cortical_fragment() -> None:
     visual_state.cortical_render_ms = (time.perf_counter() - started) * 1000.0
 
 
+@st.fragment(run_every=decode_run_every)
+def render_feature_fragment() -> None:
+    """Selected-feature cards refresh with the decoder, not the checkbox grid."""
+    if st.session_state.demo_playing:
+        st.session_state.demo_feature_fragment_run_count += 1
+    st.markdown(
+        f'<span class="demo-debug-counter demo-debug-feature" data-runs="{st.session_state.demo_feature_fragment_run_count}"></span>',
+        unsafe_allow_html=True,
+    )
+    result = st.session_state.demo_result
+    if result is None:
+        st.caption("开始数据流后，这里只展示已勾选的特征卡片。")
+        return
+    render_feature_cards(result)
+
+
 render_decode_fragment()
+render_feature_picker()
+render_feature_fragment()
 st.markdown('<div class="signal-section">神经信号分析</div>', unsafe_allow_html=True)
 signal_visual_column, map_column = st.columns([2.40, 1.02], gap="small")
 with signal_visual_column:
