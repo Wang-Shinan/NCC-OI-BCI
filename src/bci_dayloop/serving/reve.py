@@ -69,6 +69,10 @@ class ReveTaskSpec:
 
 
 REVE_TASKS: dict[str, ReveTaskSpec] = {
+    "gaze_smr": ReveTaskSpec(
+        id="gaze_smr", class_names=("left", "right", "up", "down"),
+        output_semantics="gaze_smr_direction_4", hello_task="gaze_smr",
+    ),
     "passive_rating": ReveTaskSpec(
         id="passive_rating",
         class_names=ORDINAL_CLASS_NAMES,
@@ -94,6 +98,7 @@ REVE_TASKS: dict[str, ReveTaskSpec] = {
 def normalize_reve_task(value: str) -> str:
     key = value.strip().lower().replace("-", "_")
     aliases = {
+        "gaze_smr": "gaze_smr",
         "rating": "passive_rating",
         "ordinal": "passive_rating",
         "passive_rating": "passive_rating",
@@ -123,7 +128,7 @@ def live_step_sec_for_task(task: str) -> float:
 
 def default_serve_strategy(task: str) -> str:
     """Live SMR is frozen; other REVE heads still accept supervised-head SGD."""
-    if normalize_reve_task(task) == "smr_control":
+    if normalize_reve_task(task) in ("smr_control", "gaze_smr"):
         return "none"
     return "supervised-head"
 
@@ -290,6 +295,8 @@ class ReveModelBackend:
     replay_steps: int = 12
     replay_balanced: int = 8
     lora_checkpoint: Path | None = None
+    feature_normalization: str = 'l2'
+    input_clip: float | None = None
     _model: Any = field(default=None, init=False, repr=False)
     _pos_bank: Any = field(default=None, init=False, repr=False)
     _head: nn.Linear | None = field(default=None, init=False, repr=False)
@@ -429,6 +436,8 @@ class ReveModelBackend:
                 code="invalid_window",
                 request_id=window.request_id,
             ) from error
+        if self.input_clip is not None:
+            prepared = np.clip(prepared, -self.input_clip, self.input_clip)
         prepare_ms = (time.perf_counter() - started) * 1000.0
 
         inferred = time.perf_counter()
@@ -439,7 +448,9 @@ class ReveModelBackend:
             if positions.ndim == 2:
                 positions = positions.unsqueeze(0)
             tokens = self._model(eeg, positions)
-            features = l2_normalize_features(self._model.attention_pooling(tokens))
+            features = self._model.attention_pooling(tokens)
+            if self.feature_normalization == 'l2':
+                features = l2_normalize_features(features)
             observation_id = new_observation_id()
             self._remember(observation_id, features)
             logits = self._head(features).squeeze(0).detach().cpu().numpy()
@@ -504,7 +515,7 @@ class ReveModelBackend:
         )
 
     def _remember(self, observation_id: str, features: torch.Tensor) -> None:
-        self._cache[observation_id] = l2_normalize_features(features.detach())
+        self._cache[observation_id] = l2_normalize_features(features.detach()) if self.feature_normalization == 'l2' else features.detach()
         self._cache.move_to_end(observation_id)
         while len(self._cache) > self.cache_size:
             self._cache.popitem(last=False)
@@ -609,6 +620,16 @@ class ReveModelBackend:
             return
         self._update_step = int(payload.get("step", 0))
         self.model_revision = str(payload.get("model_revision", self.model_revision))
+        normalization = payload.get('feature_normalization', 'l2')
+        if normalization not in ('none', 'l2'):
+            raise ValueError('Unsupported head feature normalization')
+        if normalization == 'none' and self.strategy != 'none':
+            raise ValueError('Unnormalized imported heads require strategy=none')
+        self.feature_normalization = normalization
+        clip = payload.get('input_clip')
+        if clip is not None and (not np.isfinite(float(clip)) or float(clip) <= 0):
+            raise ValueError('Invalid input clip')
+        self.input_clip = float(clip) if clip is not None else None
         print(
             f"[reve] state-file loaded encoder={saved_encoder} "
             f"step={self._update_step} {self.state_file}"

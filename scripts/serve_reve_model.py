@@ -75,7 +75,7 @@ def main() -> None:
         raise SystemExit(f"Missing REVE positions: {positions_dir}")
 
     lora_checkpoint = args.lora_checkpoint
-    if lora_checkpoint is None and not args.no_lora and normalize_reve_task(args.task) == "smr_control":
+    if lora_checkpoint is None and not args.no_lora and normalize_reve_task(args.task) in ("smr_control", "gaze_smr"):
         lora_checkpoint = default_stieger_lora_checkpoint()
 
     strategy = args.strategy if args.strategy else default_serve_strategy(args.task)
