@@ -51,6 +51,23 @@ class ParsedWindow:
     end_time_sec: float | None
     data: np.ndarray
     profile: DeviceProfile | None
+    electrode_names: tuple[str, ...] | None = None
+    electrode_positions: tuple[tuple[float, float, float], ...] | None = None
+
+
+def validate_electrode_positions(value: Any, channels: int) -> tuple[tuple[float, float, float], ...]:
+    if not isinstance(value, (list, tuple)) or len(value) != channels:
+        raise ValueError("electrode_positions must contain one XYZ triple per channel")
+    points = []
+    for row in value:
+        if not isinstance(row, (list, tuple)) or len(row) != 3 or any(
+            isinstance(n, bool) or not isinstance(n, (float, int)) or not math.isfinite(n) for n in row
+        ):
+            raise ValueError("electrode_positions must contain finite XYZ triples in metres")
+        points.append(tuple(float(n) for n in row))
+    if len(set(points)) != channels:
+        raise ValueError("electrode_positions must be distinct")
+    return tuple(points)
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,12 +306,27 @@ def parse_window_header(payload: dict[str, Any]) -> dict[str, Any]:
             code="invalid_window",
             request_id=request_id,
         )
+    electrode_names = payload.get("electrode_names")
+    positions = payload.get("electrode_positions")
+    try:
+        if positions is not None:
+            positions = validate_electrode_positions(positions, channels)
+        if electrode_names is not None:
+            if not isinstance(electrode_names, list) or len(electrode_names) != channels or any(
+                not isinstance(n, str) or not n.strip() for n in electrode_names
+            ) or len({n.strip().upper() for n in electrode_names}) != channels:
+                raise ValueError("electrode_names must contain one distinct position name per channel")
+            electrode_names = tuple(n.strip() for n in electrode_names)
+    except ValueError as error:
+        raise ProtocolError(str(error), code="invalid_window", request_id=request_id) from error
     return {
         "request_id": request_id,
         "window_id": coerce_window_id(payload.get("window_id")),
         "segment_id": segment_id,
         "sample_rate": sample_rate,
         "channel_names": tuple(str(name) for name in channel_names_raw),
+        "electrode_names": electrode_names,
+        "electrode_positions": positions,
         "channels": channels,
         "samples": samples,
         "start_time_sec": _finite_number(payload.get("start_time_sec")),
@@ -361,6 +393,8 @@ def complete_window(
         end_time_sec=header["end_time_sec"],
         data=data,
         profile=profile,
+        electrode_names=header.get("electrode_names"),
+        electrode_positions=header.get("electrode_positions"),
     )
 
 

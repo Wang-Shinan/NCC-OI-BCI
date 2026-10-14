@@ -1,0 +1,3 @@
+# Official ESP32 Python binding, CPython 3.11+ / Windows x64.
+# SDK revision 86539ffdb70a78a6346c23f17e1b3637dc10cfa4; independent of Rust SDK 0.2.0.
+omnibci @ https://github.com/Omni-Intel/omnibci-python/releases/download/v0.1.2/omnibci-0.1.2-cp311-abi3-win_amd64.whl#sha256=e7aaabf4b2a23879512978af27603e9288226827955d1f2ee5220f4a417094b6

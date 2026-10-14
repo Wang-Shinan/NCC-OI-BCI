@@ -31,7 +31,7 @@ def default_recordings_root() -> Path:
 
 
 def default_state_file(recordings: Path, encoder_id: str = "reve-base") -> Path:
-    return recordings / ".reve-heads" / f"{lora_state_stem(encoder_id)}.pt"
+    return recordings / ".reve-heads" / f"{lora_state_stem(encoder_id)}_tongue.pt"
 
 
 def encode_windows(backend: ReveModelBackend, windows) -> tuple[torch.Tensor, torch.Tensor]:
@@ -211,6 +211,8 @@ def load_init_state(backend: ReveModelBackend, path: Path) -> None:
     payload = torch.load(path, map_location=backend._head.weight.device, weights_only=False)
     if not isinstance(payload, dict) or "head" not in payload:
         raise SystemExit(f"--init-state missing head weights: {path}")
+    if payload.get("class_names") != list(backend.class_names):
+        raise ValueError("SMR init-state class_names mismatch; legacy both-hand heads cannot initialize a tongue head")
     backend._head.load_state_dict(payload["head"])
     backend._update_step = int(payload.get("step", 0))
     print(
@@ -228,6 +230,7 @@ def save_state(path: Path, backend: ReveModelBackend) -> None:
         "step": backend._update_step,
         "model_revision": backend.model_revision,
         "task": backend.task,
+        "class_names": list(backend.class_names),
         "encoder_id": backend.encoder_id,
     }
     buffer = BytesIO()

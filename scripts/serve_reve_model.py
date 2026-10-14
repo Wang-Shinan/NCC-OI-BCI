@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 from _bootstrap import ROOT  # noqa: F401
@@ -31,7 +32,7 @@ def main() -> None:
     parser.add_argument(
         "--task",
         default="passive_rating",
-        help="passive_rating (任务一/任务二/任务三), tetris_action (7 Tetris ops), or smr_control (left/right/both/rest).",
+        help="passive_rating (任务一/任务二/任务三), tetris_action (7 Tetris ops), or smr_control (left/right/tongue/rest).",
     )
     parser.add_argument(
         "--step-sec",
@@ -65,7 +66,25 @@ def main() -> None:
     parser.add_argument("--tcp-host", default="0.0.0.0", help="LAN follow TCP bind host.")
     parser.add_argument("--tcp-port", type=int, default=DEFAULT_TCP_PORT)
     parser.add_argument("--no-tcp", action="store_true", help="Disable JSONL TCP follow stream.")
+    parser.add_argument("--omni-endpoint", help="Direct ESP32 SDK endpoint, e.g. ble://<discovered-key>.")
+    parser.add_argument("--omni-relay", action="store_true", help="Share the acquisition page SDK owner on localhost:8772.")
+    parser.add_argument("--omni-channels", help="Comma-separated electrode names in hardware CH1..CH8 order; no assumed montage.")
+    parser.add_argument("--omni-electrodes", help="Optional electrode position names separate from channel labels.")
+    parser.add_argument("--omni-positions", help="Optional JSON array of 8 XYZ triples, metres in the REVE position-bank frame.")
     args = parser.parse_args()
+    omni_config = None
+    if args.omni_endpoint or args.omni_channels or args.omni_relay or args.omni_electrodes or args.omni_positions:
+        from bci_dayloop.serving.omni_source import OmniSourceConfig
+        if not args.omni_endpoint or not args.omni_channels:
+            parser.error("--omni-endpoint and --omni-channels must be supplied together")
+        try:
+            if args.omni_electrodes and args.omni_positions:
+                parser.error("Use either --omni-electrodes or --omni-positions")
+            omni_config = OmniSourceConfig(args.omni_endpoint, tuple(name.strip() for name in args.omni_channels.split(",")), relay=args.omni_relay,
+                electrode_names=tuple(name.strip() for name in args.omni_electrodes.split(",")) if args.omni_electrodes else None,
+                electrode_positions=json.loads(args.omni_positions) if args.omni_positions else None)
+        except ValueError as error:
+            parser.error(str(error))
     root = args.checkpoint_root.resolve()
     model_dir = root / f"reve-{args.size}"
     positions_dir = root / "reve-positions"
@@ -91,6 +110,11 @@ def main() -> None:
         lora_checkpoint=lora_checkpoint,
     )
     backend.load()
+    if omni_config is not None and omni_config.electrode_positions is None:
+        from bci_dayloop.serving.reve import resolve_channel_name
+        mapped = [resolve_channel_name(name, backend._lookup) for name in (omni_config.electrode_names or omni_config.channel_names)]
+        if any(name is None for name in mapped) or len(set(mapped)) != 8:
+            parser.error("--omni-channels must map to 8 distinct REVE electrode positions; CH1..CH8 placeholders are not positions")
     state_note = f" state-file={backend.state_file}" if backend.state_file else ""
     print(
         f"[model-service] REVE size={args.size} device={backend.torch_device_name} "
@@ -99,6 +123,14 @@ def main() -> None:
         f"strategy={backend.strategy} window={backend.window_sec:g}s "
         f"step={backend.step_sec:g}s target={backend.target_hz:g}Hz{state_note}"
     )
+    if omni_config is not None:
+        import asyncio
+        from bci_dayloop.serving.omni_service import serve_omni_model_service
+        asyncio.run(serve_omni_model_service(
+            backend, omni_config, host=args.host, port=args.port,
+            tcp_host=args.tcp_host, tcp_port=args.tcp_port, tcp_enabled=not args.no_tcp,
+        ))
+        return
     run_model_service(
         backend,
         host=args.host,

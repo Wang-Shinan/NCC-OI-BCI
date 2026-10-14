@@ -54,6 +54,19 @@ def test_window_header_and_payload_roundtrip_neuracle59():
     assert window.data.shape == (59, 4000)
 
 
+def test_electrode_metadata_roundtrip_and_validation():
+    raw = _header(BCIGO32_PROFILE)
+    raw["electrode_names"] = list(BCIGO32_PROFILE.channel_names)
+    points = [[i * .002, 0., .08] for i in range(32)]
+    raw["electrode_positions"] = points
+    window = complete_window(parse_window_header(raw), _payload(BCIGO32_PROFILE))
+    assert window.electrode_names == BCIGO32_PROFILE.channel_names
+    assert window.electrode_positions == tuple(tuple(p) for p in points)
+    for invalid in [points[:-1], [[0, 0]] * 32, [[0, 0, float('nan')]] * 32, [[0, 0, .1]] * 32]:
+        with pytest.raises(ProtocolError, match="electrode_positions"):
+            parse_window_header({**raw, "electrode_positions": invalid})
+
+
 def test_window_rejects_non_uv_and_wrong_layout():
     header = _header(NEURACLE59_PROFILE)
     header["unit"] = "V"

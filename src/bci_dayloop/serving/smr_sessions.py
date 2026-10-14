@@ -12,7 +12,7 @@ from bci_dayloop.serving.reve import SMR_CONTROL_CLASS_NAMES
 TARGET_TO_CLASS: dict[str, str] = {
     "left": "left_hand",
     "right": "right_hand",
-    "up": "both_hand",
+    "up": "tongue",
     "down": "rest",
 }
 
@@ -225,11 +225,20 @@ def extract_labeled_windows(
     windows: list[LabeledWindow] = []
     seen: set[int] = set()
     labeled_events: list[dict[str, Any]] = []
+    all_events = [json.loads(line) for line in (recording_dir / 'events.jsonl').read_text(encoding='utf-8').splitlines() if line.strip()]
+    tongue_session = any((event.get('data') or {}).get('imagerySchema') == 'left-right-tongue-rest-v1'
+                         or ((event.get('data') or {}).get('mapping') or {}).get('up') == 'tongue'
+                         for event in all_events if event.get('type') in ('session_start', 'group_start'))
     for event in _iter_label_events(recording_dir / "events.jsonl", label_source=label_source):
         payload = event.get("data") or {}
         target = str(payload.get("target") or "").strip().lower()
         if class_id_for_target(target) is None or _event_end_index(event) is None:
             continue
+        explicit = payload.get('className') or payload.get('class_name')
+        if explicit and explicit != TARGET_TO_CLASS[target]:
+            raise ValueError(f'{recording_dir.name}: label {explicit} conflicts with {target}; legacy both-hand data cannot be relabeled as tongue')
+        if target == 'up' and explicit != 'tongue' and not tongue_session:
+            raise ValueError(f'{recording_dir.name}: up trial has no tongue imagery label; preserve legacy data and collect new tongue trials')
         labeled_events.append(event)
     events = _keep_nonoverlapping_events(labeled_events, hop_samples=hop_samples)
 

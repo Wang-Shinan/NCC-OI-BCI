@@ -66,6 +66,7 @@ def lora_state_stem(encoder_id: str) -> str:
     return f"smr_control_{encoder_id}"
 
 
+# Historical Stieger checkpoints without metadata used both hands, never tongue.
 SMR_4CLASS_LABELS = ("left_hand", "right_hand", "both_hand", "rest")
 
 

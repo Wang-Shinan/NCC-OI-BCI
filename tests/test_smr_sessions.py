@@ -298,7 +298,7 @@ def test_extract_pads_window_that_starts_before_file(tmp_path: Path):
         events=[
             {
                 "type": "trial",
-                "data": {"index": 0, "target": "up", "outcome": "miss"},
+                "data": {"index": 0, "target": "up", "className": "tongue", "outcome": "miss"},
                 "eeg": {"sampleIndex": 1200},
             }
         ],
@@ -306,7 +306,7 @@ def test_extract_pads_window_that_starts_before_file(tmp_path: Path):
     windows = extract_labeled_windows(recording, window_sec=2.0, min_coverage=0.3)
     assert len(windows) == 1
     assert windows[0].padded is True
-    assert windows[0].class_name == "both_hand"
+    assert windows[0].class_name == "tongue"
     assert windows[0].data.shape == (2, 500)
     assert float(windows[0].data[:, :300].sum()) == 0.0
 
@@ -318,6 +318,27 @@ def test_load_ct_bin_rejects_incomplete_file(tmp_path: Path):
     np.arange(5, dtype=np.float32).astype("<f4").tofile(path)
     with pytest.raises(ValueError, match="not a complete"):
         load_ct_bin(path, channels=2)
+
+
+@pytest.mark.parametrize('label', [None, 'both_hand', 'both_hands'])
+def test_legacy_up_trials_are_not_relabeled_as_tongue(tmp_path: Path, label):
+    recording = _write_recording(tmp_path, 'legacy', events=[{
+        'type': 'trial', 'data': {'target': 'up', 'className': label},
+        'eeg': {'sampleIndex': 1700},
+    }])
+    with pytest.raises(ValueError, match='tongue'):
+        extract_labeled_windows(recording)
+
+
+def test_group_protocol_marks_tongue_trials(tmp_path: Path):
+    recording = _write_recording(tmp_path, 'tongue', events=[
+        {'type': 'group_start', 'data': {'imagerySchema': 'left-right-tongue-rest-v1'}},
+        {'type': 'trial', 'data': {'target': 'up'}, 'eeg': {'sampleIndex': 1700}},
+    ])
+    windows = extract_labeled_windows(recording)
+    assert len(windows) == 1
+    assert windows[0].class_name == 'tongue'
+    assert windows[0].class_id == 2
 
 
 def test_windows_to_hdf5_drops_padded_and_rejects_empty(tmp_path: Path):

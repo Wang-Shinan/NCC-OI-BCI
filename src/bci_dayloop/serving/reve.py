@@ -26,6 +26,7 @@ from bci_dayloop.serving.protocol import (
     feedback_ack_message,
     hello_message,
     new_observation_id,
+    validate_electrode_positions,
 )
 from bci_dayloop.serving.reve_lora import (
     apply_merged_state_dict,
@@ -48,7 +49,7 @@ TETRIS_ACTION_CLASS_NAMES: tuple[str, ...] = (
 SMR_CONTROL_CLASS_NAMES: tuple[str, ...] = (
     "left_hand",
     "right_hand",
-    "both_hand",
+    "tongue",
     "rest",
 )
 CHANNEL_ALIASES: dict[str, str] = {
@@ -139,6 +140,9 @@ def default_checkpoint_root() -> Path:
 
 def _compat_patch_reve_modeling(model_dir: Path) -> None:
     """REVE upstream assumes torch>=2.2 SDPA; NCC env is still 2.0.1."""
+    from packaging.version import Version
+    if Version(torch.__version__.split('+')[0]) >= Version('2.2'):
+        return  # Preserve downloaded upstream code and its provenance on modern torch.
     path = model_dir / "modeling_reve.py"
     if not path.is_file():
         return
@@ -251,8 +255,18 @@ def prepare_reve_window(
     *,
     window_sec: float = REVE_WINDOW_SEC,
     target_hz: float = REVE_TARGET_HZ,
+    electrode_positions: Sequence[Sequence[float]] | None = None,
+    require_all_channels: bool = False,
 ) -> tuple[np.ndarray, tuple[str, ...]]:
-    selected, names = select_supported_channels(data, channel_names, lookup)
+    if electrode_positions is not None:
+        if data.ndim != 2 or data.shape[0] != len(channel_names) or len(channel_names) < 4:
+            raise ValueError("REVE needs at least 4 EEG channels with matching coordinates")
+        validate_electrode_positions(electrode_positions, len(channel_names))
+        selected, names = data, tuple(channel_names)
+    else:
+        selected, names = select_supported_channels(data, channel_names, lookup)
+        if require_all_channels and (len(names) != len(channel_names) or len(set(names)) != len(names)):
+            raise ValueError("Every explicit electrode name must map to a distinct REVE position")
     dst_samples = int(round(window_sec * target_hz))
     if abs(sample_rate - target_hz) > 1e-6 or selected.shape[1] != dst_samples:
         selected = resample_to_length(selected, dst_samples)
@@ -305,6 +319,8 @@ class ReveModelBackend:
     _cache: OrderedDict[str, torch.Tensor] = field(default_factory=OrderedDict, init=False, repr=False)
     _replay: list[list[torch.Tensor]] = field(default_factory=list, init=False, repr=False)
     _update_step: int = field(default=0, init=False, repr=False)
+    _head_source: str = field(default='untrained', init=False, repr=False)
+    head_initialization: dict[str, Any] | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         spec = get_reve_task(self.task)
@@ -387,6 +403,22 @@ class ReveModelBackend:
             )
         else:
             seeded = 0
+        # A new subject starts from the entire pretrained head. This is transfer
+        # initialization, not a claim that legacy both-hand data labels were tongue.
+        legacy_names = ('left_hand', 'right_hand', 'both_hand', 'rest')
+        legacy_transfer = self.task == 'smr_control' and payload.label_names == legacy_names and seeded == 3
+        if legacy_transfer:
+            with torch.no_grad():
+                self._head.weight[2].copy_(payload.head_weight[2].to(self._head.weight))
+                self._head.bias[2].copy_(payload.head_bias[2].to(self._head.bias))
+            seeded += 1
+        self.head_initialization = {
+            'source': 'lora-checkpoint', 'encoder_id': payload.encoder_id,
+            'source_class_names': list(payload.label_names), 'target_class_names': list(self.class_names),
+            'legacy_transfer': legacy_transfer, 'copied_rows': seeded,
+        }
+        if seeded == len(self.class_names):
+            self._head_source = 'lora-checkpoint'
         print(
             f"[reve] lora={payload.encoder_id} rank={payload.rank} alpha={payload.alpha:g} "
             f"loaded={stats['loaded']} missing={stats['missing']} seeded_head={seeded}"
@@ -398,7 +430,7 @@ class ReveModelBackend:
 
     def hello_payload(self) -> dict[str, Any]:
         spec = self.task_spec
-        return hello_message(
+        payload = hello_message(
             service="ncc-reve",
             model_name=self.model_dir.name,
             model_type="reve",
@@ -409,6 +441,13 @@ class ReveModelBackend:
             window_sec=self.window_sec,
             step_sec=float(self.step_sec),
         )
+        if self._head_source == 'untrained' and self._update_step == 0:
+            payload['warning'] = '分类头尚未训练：当前仅验证 REVE 推理链路，不能用于有效脑控。请先采集标签并训练。'
+        if self.head_initialization:
+            payload['head_initialization'] = self.head_initialization
+            if self.head_initialization.get('legacy_transfer') and self._update_step == 0:
+                payload['warning'] = '使用 LoRA 自带完整线性头初始化；第三行源于双手类别，尚未经过本被试舌头想象训练。'
+        return payload
 
     def predict(self, window: ParsedWindow) -> PredictionResult:
         if self._model is None or self._pos_bank is None or self._head is None:
@@ -424,11 +463,13 @@ class ReveModelBackend:
         try:
             prepared, names = prepare_reve_window(
                 window.data,
-                window.channel_names,
+                window.electrode_names if window.electrode_positions is None and window.electrode_names is not None else window.channel_names,
                 window.sample_rate,
                 self._lookup,
                 window_sec=self.window_sec,
                 target_hz=self.target_hz,
+                electrode_positions=window.electrode_positions,
+                require_all_channels=window.electrode_names is not None,
             )
         except ValueError as error:
             raise ProtocolError(
@@ -444,7 +485,10 @@ class ReveModelBackend:
         eeg = torch.from_numpy(np.ascontiguousarray(prepared)).unsqueeze(0)
         eeg = eeg.to(self._torch_device, dtype=torch.float32)
         with torch.no_grad():
-            positions = self._pos_bank(list(names)).to(self._torch_device)
+            positions = (
+                torch.tensor(window.electrode_positions, dtype=torch.float32, device=self._torch_device)
+                if window.electrode_positions is not None else self._pos_bank(list(names)).to(self._torch_device)
+            )
             if positions.ndim == 2:
                 positions = positions.unsqueeze(0)
             tokens = self._model(eeg, positions)
@@ -607,6 +651,8 @@ class ReveModelBackend:
         saved_task = str(payload.get("task", "passive_rating"))
         if normalize_reve_task(saved_task) != self.task:
             return
+        if self.task == 'smr_control' and payload.get('class_names') != list(self.class_names):
+            raise ValueError('SMR head class_names mismatch: require left_hand/right_hand/tongue/rest; legacy both-hand heads must be retrained')
         saved_encoder = str(payload.get("encoder_id", self.model_dir.name))
         if saved_encoder != self.encoder_id:
             print(
@@ -630,6 +676,8 @@ class ReveModelBackend:
         if clip is not None and (not np.isfinite(float(clip)) or float(clip) <= 0):
             raise ValueError('Invalid input clip')
         self.input_clip = float(clip) if clip is not None else None
+        self._head_source = 'state-file'
+        self.head_initialization = payload.get('head_initialization')
         print(
             f"[reve] state-file loaded encoder={saved_encoder} "
             f"step={self._update_step} {self.state_file}"
@@ -655,6 +703,8 @@ class ReveModelBackend:
             "step": self._update_step,
             "model_revision": self.model_revision,
             "task": self.task,
+            "class_names": list(self.class_names),
+            "head_initialization": self.head_initialization,
             "encoder_id": self.encoder_id,
             "replay": [[item.detach().cpu() for item in bucket] for bucket in self._replay],
         }

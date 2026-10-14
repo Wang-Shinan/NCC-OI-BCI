@@ -66,6 +66,25 @@ def test_resample_preserves_endpoints():
     assert out[0, -1] == pytest.approx(20.0)
 
 
+def test_explicit_xyz_bypasses_name_lookup_without_dropping_channels():
+    data = np.random.default_rng(1).normal(size=(8, 500)).astype(np.float32)
+    labels = tuple(f"CH{i + 1}" for i in range(8))
+    points = tuple((i * .01, 0., .08) for i in range(8))
+    prepared, names = prepare_reve_window(data, labels, 250, {}, electrode_positions=points)
+    assert names == labels
+    assert prepared.shape == (8, 400)
+    with pytest.raises(ValueError, match="XYZ"):
+        prepare_reve_window(data, labels, 250, {}, electrode_positions=points[:-1])
+
+
+def test_explicit_named_positions_must_all_resolve_without_alias_duplicates():
+    data = np.zeros((5, 500), dtype=np.float32)
+    lookup = build_position_lookup(["F3", "F4", "C3", "T7"])
+    for names in [("F3", "F4", "C3", "T7", "unknown"), ("F3", "F4", "C3", "T7", "T3")]:
+        with pytest.raises(ValueError, match="distinct"):
+            prepare_reve_window(data, names, 250, lookup, require_all_channels=True)
+
+
 def test_reve_hello_advertises_two_second_window(tmp_path: Path):
     backend = ReveModelBackend(model_dir=tmp_path / "reve-base", positions_dir=tmp_path / "reve-positions")
     hello = backend.hello_payload()
@@ -336,6 +355,44 @@ def test_seed_linear_head_copies_left_right_only():
     assert float(head.weight[3].abs().sum()) == 0.0
 
 
+def test_new_subject_keeps_full_lora_head_with_transfer_provenance(tmp_path: Path, monkeypatch):
+    import torch
+    from torch import nn
+    from types import SimpleNamespace
+    from bci_dayloop.serving import reve
+
+    weight = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    bias = torch.arange(4, dtype=torch.float32)
+    payload = SimpleNamespace(state_dict={}, rank=4, alpha=8, encoder_id='general',
+        label_names=('left_hand', 'right_hand', 'both_hand', 'rest'), head_weight=weight, head_bias=bias)
+    monkeypatch.setattr(reve, 'load_reve_lora_payload', lambda _: payload)
+    monkeypatch.setattr(reve, 'merge_peft_lora_state_dict', lambda *a, **kw: {})
+    monkeypatch.setattr(reve, 'apply_merged_state_dict', lambda *a: {'loaded': 0, 'missing': 0})
+    backend = ReveModelBackend(model_dir=tmp_path / 'reve-base', positions_dir=tmp_path / 'positions',
+        task='smr_control', lora_checkpoint=tmp_path / 'general' / 'best.pt')
+    backend._head = nn.Linear(3, 4)
+    backend._model = nn.Identity()
+    backend.lora_checkpoint.parent.mkdir(parents=True)
+    backend.lora_checkpoint.touch()
+    reve.init_linear_head(backend._head)
+    backend._apply_lora_checkpoint()
+    torch.testing.assert_close(backend._head.weight, weight)
+    torch.testing.assert_close(backend._head.bias, bias)
+    assert backend._head_source == 'lora-checkpoint'
+    assert backend.head_initialization['legacy_transfer'] is True
+    assert backend.head_initialization['source_class_names'][2] == 'both_hand'
+    assert backend.hello_payload()['model']['class_names'][2] == 'tongue'
+    assert 'LoRA' in backend.hello_payload()['warning']
+
+    backend.state_file = tmp_path / 'baseline.pt'
+    backend._torch_device = torch.device('cpu')
+    backend._save_state_file()
+    backend.head_initialization = None
+    backend._load_state_file()
+    assert backend.head_initialization['legacy_transfer'] is True
+    torch.testing.assert_close(backend._head.weight, weight)
+
+
 def test_encoder_id_uses_lora_folder_name(tmp_path: Path):
     backend = ReveModelBackend(
         model_dir=tmp_path / "reve-base",
@@ -344,6 +401,39 @@ def test_encoder_id_uses_lora_folder_name(tmp_path: Path):
         lora_checkpoint=tmp_path / "stieger2021_lr_reve_lora_r16_mi5init" / "best.pt",
     )
     assert backend.encoder_id == "stieger2021_lr_reve_lora_r16_mi5init"
+
+
+def test_legacy_adapter_does_not_seed_tongue_row():
+    import torch
+    from torch import nn
+    from bci_dayloop.serving.reve import SMR_CONTROL_CLASS_NAMES, init_linear_head
+    from bci_dayloop.serving.reve_lora import seed_linear_head_from_labels
+
+    head = nn.Linear(3, 4)
+    init_linear_head(head)
+    weight, bias = torch.ones(4, 3), torch.ones(4)
+    copied = seed_linear_head_from_labels(head, weight, bias,
+        source_names=('left_hand', 'right_hand', 'both_hand', 'rest'),
+        dest_names=SMR_CONTROL_CLASS_NAMES)
+    assert copied == 3
+    assert float(head.weight[2].abs().sum()) == 0
+    assert float(head.bias[2]) == 0
+
+
+@pytest.mark.parametrize('class_names', [None, ['left_hand', 'right_hand', 'both_hand', 'rest']])
+def test_legacy_smr_head_is_rejected(tmp_path: Path, class_names):
+    import torch
+    from torch import nn
+
+    state_file = tmp_path / 'legacy.pt'
+    head = nn.Linear(3, 4)
+    torch.save({'task': 'smr_control', 'class_names': class_names, 'head': head.state_dict()}, state_file)
+    backend = ReveModelBackend(model_dir=tmp_path / 'reve-base',
+        positions_dir=tmp_path / 'reve-positions', task='smr_control', state_file=state_file)
+    backend._torch_device = torch.device('cpu')
+    backend._head = head
+    with pytest.raises(ValueError, match='class_names mismatch'):
+        backend._load_state_file()
 
 
 def test_normalize_reve_task_aliases_and_rejects_unknown():
@@ -528,8 +618,10 @@ def test_state_file_roundtrip_restores_head_and_replay(tmp_path: Path):
     assert len(restored._replay[0]) == 1
 
 
-def test_compat_patch_reve_modeling_disables_sdpa(tmp_path: Path):
+def test_compat_patch_reve_modeling_disables_sdpa(tmp_path: Path, monkeypatch):
+    import torch
     from bci_dayloop.serving.reve import _compat_patch_reve_modeling
+    monkeypatch.setattr(torch, '__version__', '2.0.1')
 
     path = tmp_path / "modeling_reve.py"
     path.write_text(
