@@ -98,6 +98,7 @@ class PredictionResult:
     inference_latency_ms: float = 0.0
     task: str = "motor_imagery"
     output_semantics: str | None = None
+    logits: tuple[float, ...] | None = None
 
 
 def dumps(payload: dict[str, Any]) -> str:
@@ -194,6 +195,8 @@ def prediction_message(result: PredictionResult) -> dict[str, Any]:
     }
     if result.output_semantics:
         payload["output_semantics"] = result.output_semantics
+    if result.logits is not None:
+        payload['logits'] = list(result.logits)
     return payload
 
 

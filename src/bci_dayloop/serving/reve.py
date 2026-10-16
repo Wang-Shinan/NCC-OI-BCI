@@ -311,6 +311,8 @@ class ReveModelBackend:
     lora_checkpoint: Path | None = None
     feature_normalization: str = 'l2'
     input_clip: float | None = None
+    preprocessing_profile: str | None = None
+    input_channel_names: tuple[str, ...] = ()
     _model: Any = field(default=None, init=False, repr=False)
     _pos_bank: Any = field(default=None, init=False, repr=False)
     _head: nn.Linear | None = field(default=None, init=False, repr=False)
@@ -447,6 +449,14 @@ class ReveModelBackend:
             payload['head_initialization'] = self.head_initialization
             if self.head_initialization.get('legacy_transfer') and self._update_step == 0:
                 payload['warning'] = '使用 LoRA 自带完整线性头初始化；第三行源于双手类别，尚未经过本被试舌头想象训练。'
+        if self.preprocessing_profile:
+            payload['input']['slide_sec'] = 0.1
+            payload['supports_group_training'] = self.preprocessing_profile == 's04-mne-4s-v1' and self.window_sec in (2, 4)
+            payload['preprocessing'] = {
+                'profile': self.preprocessing_profile, 'feature_normalization': self.feature_normalization,
+                'input_clip': self.input_clip, 'channel_names': list(self.input_channel_names),
+                'target_hz': self.target_hz,
+            }
         return payload
 
     def predict(self, window: ParsedWindow) -> PredictionResult:
@@ -461,16 +471,21 @@ class ReveModelBackend:
             )
         started = time.perf_counter()
         try:
-            prepared, names = prepare_reve_window(
-                window.data,
-                window.electrode_names if window.electrode_positions is None and window.electrode_names is not None else window.channel_names,
-                window.sample_rate,
-                self._lookup,
-                window_sec=self.window_sec,
-                target_hz=self.target_hz,
-                electrode_positions=window.electrode_positions,
-                require_all_channels=window.electrode_names is not None,
-            )
+            if self.preprocessing_profile == 's04-mne-4s-v1':
+                from bci_dayloop.serving.reve_s04 import prepare_s04_window
+                prepared, names = prepare_s04_window(window.data, window.channel_names,
+                    window.sample_rate, self.input_channel_names, window_sec=self.window_sec)
+            else:
+                prepared, names = prepare_reve_window(
+                    window.data,
+                    window.electrode_names if window.electrode_positions is None and window.electrode_names is not None else window.channel_names,
+                    window.sample_rate,
+                    self._lookup,
+                    window_sec=self.window_sec,
+                    target_hz=self.target_hz,
+                    electrode_positions=window.electrode_positions,
+                    require_all_channels=window.electrode_names is not None,
+                )
         except ValueError as error:
             raise ProtocolError(
                 str(error),
@@ -487,7 +502,8 @@ class ReveModelBackend:
         with torch.no_grad():
             positions = (
                 torch.tensor(window.electrode_positions, dtype=torch.float32, device=self._torch_device)
-                if window.electrode_positions is not None else self._pos_bank(list(names)).to(self._torch_device)
+                if window.electrode_positions is not None and self.preprocessing_profile is None
+                else self._pos_bank(list(names)).to(self._torch_device)
             )
             if positions.ndim == 2:
                 positions = positions.unsqueeze(0)
@@ -511,6 +527,7 @@ class ReveModelBackend:
             class_name=spec.class_names[class_id],
             class_names=spec.class_names,
             probabilities=tuple(float(value) for value in probabilities),
+            logits=tuple(float(value) for value in logits),
             confidence=float(probabilities[class_id]),
             model_revision=self.model_revision,
             online_update_step=self._update_step,
@@ -676,6 +693,23 @@ class ReveModelBackend:
         if clip is not None and (not np.isfinite(float(clip)) or float(clip) <= 0):
             raise ValueError('Invalid input clip')
         self.input_clip = float(clip) if clip is not None else None
+        profile = payload.get('preprocessing_profile')
+        if profile not in (None, 's04-mne-4s-v1'):
+            raise ValueError('Unsupported REVE preprocessing profile')
+        self.preprocessing_profile = profile
+        if profile == 's04-mne-4s-v1':
+            names = payload.get('input_channel_names', [])
+            if (self.task != 'smr_control' or self.strategy != 'none' or normalization != 'none'
+                or self.input_clip != 15 or len(names) != 31 or len(set(names)) != 31
+                or not all(isinstance(n, str) and n for n in names)):
+                raise ValueError('Invalid S04 imported model input contract')
+            self.input_channel_names = tuple(names)
+            self.window_sec = float(payload.get('input_window_sec', 4))
+            if self.window_sec not in (2, 4):
+                raise ValueError('S04 input window must be 2 or 4 seconds')
+            self.target_hz = 200.0
+            if not 0 < float(self.step_sec) <= self.window_sec:
+                raise ValueError('Invalid S04 prediction hop')
         self._head_source = 'state-file'
         self.head_initialization = payload.get('head_initialization')
         print(
@@ -706,6 +740,13 @@ class ReveModelBackend:
             "class_names": list(self.class_names),
             "head_initialization": self.head_initialization,
             "encoder_id": self.encoder_id,
+            "lora_checkpoint": str(self.lora_checkpoint) if self.lora_checkpoint else None,
+            "size": self.model_dir.name.removeprefix('reve-'),
+            "feature_normalization": self.feature_normalization,
+            "input_clip": self.input_clip,
+            "preprocessing_profile": self.preprocessing_profile,
+            "input_channel_names": list(self.input_channel_names),
+            "input_window_sec": self.window_sec,
             "replay": [[item.detach().cpu() for item in bucket] for bucket in self._replay],
         }
         buffer = BytesIO()

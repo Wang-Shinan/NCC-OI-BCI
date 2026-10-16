@@ -24,6 +24,7 @@ __pycache__/
 
 .pytest_cache/
 .pytest_tmp/
+.tmp-reve-check-*/
 .mypy_cache/
 .ruff_cache/
 

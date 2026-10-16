@@ -11,4 +11,5 @@ h5py==3.14.0
 PyYAML==6.0.2
 scikit-learn==1.7.2
 peft==0.17.1
+mne==1.12.1
 pytest==8.4.2

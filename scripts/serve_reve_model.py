@@ -72,6 +72,17 @@ def main() -> None:
     parser.add_argument("--omni-electrodes", help="Optional electrode position names separate from channel labels.")
     parser.add_argument("--omni-positions", help="Optional JSON array of 8 XYZ triples, metres in the REVE position-bank frame.")
     args = parser.parse_args()
+    if args.task == 'smr_dual_axis':
+        if args.state_file is None:
+            parser.error('smr_dual_axis requires a dual-axis manifest --state-file')
+        if args.omni_endpoint or args.omni_relay:
+            parser.error('S04 dual-axis models require the trained 31 EEG electrodes, not Omni 8-channel input')
+        from bci_dayloop.serving.reve_dual_axis import DualAxisReveBackend
+        backend = DualAxisReveBackend(args.checkpoint_root / f'reve-{args.size}', args.checkpoint_root / 'reve-positions',
+            args.state_file, device=args.device, step_sec=args.step_sec or .5)
+        backend.load()
+        run_model_service(backend, host=args.host, port=args.port, tcp_host=args.tcp_host, tcp_port=args.tcp_port, tcp_enabled=not args.no_tcp)
+        return
     omni_config = None
     if args.omni_endpoint or args.omni_channels or args.omni_relay or args.omni_electrodes or args.omni_positions:
         from bci_dayloop.serving.omni_source import OmniSourceConfig

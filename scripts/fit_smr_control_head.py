@@ -20,7 +20,7 @@ from bci_dayloop.serving.reve import (
 )
 from bci_dayloop.serving.reve_lora import default_stieger_lora_checkpoint, lora_state_stem
 from bci_dayloop.serving.smr_sessions import discover_smr_recordings, extract_all_labeled_windows
-from bci_dayloop.serving.profiles import REVE_TARGET_HZ, REVE_WINDOW_SEC
+from bci_dayloop.serving.profiles import REVE_TARGET_HZ
 
 
 def default_recordings_root() -> Path:
@@ -40,10 +40,11 @@ def encode_windows(backend: ReveModelBackend, windows) -> tuple[torch.Tensor, to
     if windows:
         src_hz = float(windows[0].sample_rate)
         src_samples = int(windows[0].data.shape[1])
-        dst_samples = int(round(REVE_WINDOW_SEC * REVE_TARGET_HZ))
+        window_sec = float(backend.window_sec)
+        dst_samples = int(round(window_sec * REVE_TARGET_HZ))
         print(
             f"[fit-smr] resample {src_hz:g} Hz × {src_samples} samples "
-            f"-> {REVE_TARGET_HZ:g} Hz × {dst_samples} samples ({REVE_WINDOW_SEC:g}s)"
+            f"-> {REVE_TARGET_HZ:g} Hz × {dst_samples} samples ({window_sec:g}s)"
         )
         if abs(src_hz - REVE_TARGET_HZ) < 1e-6:
             print("[fit-smr] source already at REVE target Hz")
